@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+sessions/
+config.json
+*.wav
+*.npy
+/tmp/
