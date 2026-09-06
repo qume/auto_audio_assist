@@ -182,7 +182,8 @@ def output_options(remote_host="", remote_dev="default"):
     opts = [dict(s, kind="pw") for s in list_sinks()]
     if remote_host:
         opts.append({"id": None, "name": f"ssh:{remote_host}:{remote_dev or 'default'}", "kind": "ssh",
-                     "desc": f"Remote via ssh: {remote_host} -> aplay -D {remote_dev or 'default'}"})
+                     "desc": f"Remote via ssh: {remote_host} -> " + (f"pw-play --target {remote_dev[3:]}" if remote_dev.startswith("pw:") else f"aplay -D {remote_dev or 'default'}")})
+    # remote-side tail: AirPlay/RAOP adds ~2 s of buffering, so keep recording longer after playback ends
     opts.append({"id": None, "name": "file:manual", "kind": "file",
                  "desc": "Manual / sneakernet: you play the exported WAV on any device, this app only records"})
     return opts
@@ -198,9 +199,12 @@ def play(path, sink, blocking=True):
     kind = sink.get("kind", "pw")
     if kind == "ssh":
         host, dev = _ssh_parts(sink["name"])
-        p = subprocess.Popen(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
-                              f"aplay -q -t wav -D {dev} -"], stdin=open(path, "rb"),
-                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if dev.startswith("pw:"):      # PipeWire node on the remote box (e.g. pw:raop-marantz)
+            remote = f"pw-play --target {dev[3:]} -"
+        else:                          # ALSA device on the remote box (e.g. default, hw:0,0)
+            remote = f"aplay -q -t wav -D {dev} -"
+        p = subprocess.Popen(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote],
+                             stdin=open(path, "rb"), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     elif kind == "file":
         return None
     else:
@@ -240,7 +244,8 @@ def play_and_record(signal_stereo, sink, source, workdir, sr=SR, tail_s=1.5, als
             err = p.stderr.read().decode(errors="replace") if p.stderr else ""
             rec.stop()
             raise RuntimeError(f"remote playback failed ({p.returncode}): {err[-500:]}")
-        time.sleep(tail_s)
+        # network renderers (AirPlay/RAOP, Chromecast) buffer ~2 s: record well past the end of playback
+        time.sleep(max(tail_s, 5.0) if sink.get("kind") == "ssh" else tail_s)
     x = rec.stop()
     x -= x.mean(axis=0)
     # multi-capsule raw arrays (Apple: 3 capsules ~2 cm apart) are NOT averaged: the spacing would
@@ -271,10 +276,13 @@ def install_remote_sink(host, dev="default", desc=None):
                 f"context.objects = [\n  {{ factory = adapter args = {node_args} }}\n]\n")
     if not any(n["name"] == REMOTE_SINK for n in list_sinks()):
         subprocess.run(["pw-cli", "create-node", "adapter", node_args], capture_output=True)
+    if dev.startswith("pw:"):
+        remote_cmd = f"pw-play --target {dev[3:]} --raw --format s16 --rate 48000 --channels 2 -"
+    else:
+        remote_cmd = f"aplay -q -t raw -f S16_LE -r 48000 -c 2 -D {dev} --buffer-time=400000 -"
     pipe = (f"/usr/bin/sh -c 'pw-record --target {REMOTE_SINK} -P \"{{ stream.capture.sink = true }}\" --raw "
             f"--format s16 --rate 48000 --channels 2 --latency 100ms - | "
-            f"ssh -o BatchMode=yes -o ServerAliveInterval=15 -o ExitOnForwardFailure=yes {host} "
-            f"\"aplay -q -t raw -f S16_LE -r 48000 -c 2 -D {dev} --buffer-time=400000 -\"'")
+            f"ssh -o BatchMode=yes -o ServerAliveInterval=15 -o ExitOnForwardFailure=yes {host} \"{remote_cmd}\"'")
     with open(SERVICE, "w") as f:
         f.write(f"""[Unit]
 Description=auto_audio_assist: stream PipeWire sink {REMOTE_SINK} to {host} (aplay)

@@ -63,6 +63,15 @@ callback runs on the main thread. Tk raises "main thread is not in main loop" ot
   `App.set_mic_profile` when that source is selected. Prefer the raw `alsa:hw:...HPAI` device,
   which returns float32 regardless of the requested format (`probe_alsa_format` detects this).
 
+## EQ sink and remote install
+
+`eqexport.as_pipewire_conf` builds a filter-chain with one path per channel (`invert` → `delay`
+→ `bq_peaking`...). `target.object` in `playback.props` must name an existing node, otherwise
+PipeWire silently links to the default sink — check with `pw-link -l | grep aaa_room_eq_output`.
+Validate a chain without restarting anything: `pw-cli -m load-module libpipewire-module-filter-chain
+"<the args block>"` loads it for as long as pw-cli runs. The remote installer (`install_pipewire_remote`)
+writes the conf over ssh, restarts the remote user services and sets the default sink by node name.
+
 ## Adding a test or verdict
 
 1. Compute it in `analysis.py` as plain data; add it to the evidence dict with its inputs.

@@ -42,9 +42,10 @@ at the bottom where you can ask questions in context at any time.
 1. **Setup** — choose the output that feeds your amplifier, the microphone, describe the speakers
    and room (dimensions, distance from mic to each speaker), and pick the LLM backend. Saved to
    `config.json` (git-ignored; it may hold an API key).
-2. **Mic profile** — the LLM researches a rough response curve for your microphone and it is
-   cached under `mics/`. Reference mic? Use flat. On Asahi Linux laptops the raw mic array is
-   read directly, bypassing the beamformer and its 120 Hz high-pass.
+2. **Mic profile** — load the calibration file of a measurement mic (Dayton UMM-6, miniDSP
+   UMIK-1, any REW-style `freq dB` text file, or the tool's JSON), or let the LLM research a rough
+   curve for a laptop mic (cached under `mics/`). On Asahi Linux laptops the raw mic array is read
+   directly, bypassing the beamformer and its 120 Hz high-pass.
 3. **Level check** — noise floor, pink noise, per-band signal-to-noise. Judged relative to your
    room's noise so an insensitive laptop mic is fine. **Identify channels** plays the LEFT channel
    only so you can confirm by ear which speaker is which.
@@ -55,9 +56,11 @@ at the bottom where you can ask questions in context at any time.
 6. **Room modes** — peaks against a one-octave trend, matched to the axial modes predicted from
    your room dimensions; deep dips flagged as un-EQ-able; octave-band balance. The LLM suggests
    physical changes first. Loop until you are happy, then accept the corrections.
-7. **Export** — Equalizer APO / EasyEffects text, a one-click PipeWire **Room EQ** virtual sink
-   on the source computer, and LLM-written guidance for your amp's EQ, an external DSP, or software
-   on macOS/Windows.
+7. **Export** — Equalizer APO / EasyEffects text, a PipeWire **Room EQ** virtual sink installed
+   either on the source computer or **on a remote PipeWire box over ssh** (the Pi that feeds the
+   amp), and LLM-written guidance for your amp's EQ, an external DSP, or software on macOS/Windows.
+   The Room EQ sink can also **fix problems in the stream**: invert one channel's polarity and
+   delay the nearer channel to time-align the pair, alongside the parametric EQ.
 
 ### How the polarity checks work
 
@@ -79,13 +82,25 @@ flips only the upper bands while the bass tests stay positive.
 The source computer is often nowhere near the amplifier. Setup offers:
 
 - any **PipeWire sink** on the computer
-- **ssh → aplay** to a remote Linux box wired to the amp (a headless Raspberry Pi, say);
-  *Install system-wide sink for it* creates a PipeWire sink "Amp via host" plus a user service
-  that streams it over ssh, so the remote box becomes an ordinary system output
+- **ssh** to a remote Linux box that feeds the amp (a headless Raspberry Pi, say): the remote
+  device field takes an ALSA device (`default`, `hw:0,0`) or a PipeWire node (`pw:raop-marantz`,
+  played with `pw-play`). *Install system-wide sink for it* creates a PipeWire sink "Amp via host"
+  plus a user service that streams it over ssh, so the remote box becomes an ordinary system output
 - **manual / sneakernet**: export the test WAV, play it from anything, the app only records
 
 Playback latency does not matter. The analysis finds the first sweep wherever it lands in the
 recording, and relative timing between channels is preserved because everything is one file.
+
+### Correcting at the receiver
+
+If a PipeWire box sits between every source and the amplifier (here: a Raspberry Pi that takes
+Bluetooth via BlueALSA and Spotify Connect via librespot and sends AirPlay to a Marantz), the
+right place for the correction is there. *Install Room EQ on remote box* writes
+`~/.config/pipewire/pipewire.conf.d/60-aaa-room-eq.conf` on the box, restarts its user PipeWire,
+and makes the Room EQ sink the default, so `bluealsa-aplay --pcm=pipewire`, librespot and anything
+else that follows the default sink is corrected before it leaves for the amp. The chain is one
+independent path per channel: optional `invert`, optional `delay`, then `bq_peaking` stages.
+*Remove from remote box* deletes it and restores the previous default sink.
 
 ## Command line
 

@@ -51,3 +51,30 @@ def mic_profile_path(key):
     os.makedirs(MICS, exist_ok=True)
     safe = "".join(ch if ch.isalnum() else "_" for ch in key)[:80]
     return os.path.join(MICS, safe + ".json")
+
+
+def load_mic_calibration(path):
+    """Read a microphone profile from JSON ({"points": [[f, dB], ...]}) or a plain-text calibration
+    file as shipped by Dayton (UMM-6), miniDSP (UMIK-1), Cross-Spectrum etc. and understood by REW:
+    optional header lines (e.g. "Sens Factor =-1.2dB, SERNO: 12345"), then "frequency  dB" pairs.
+    Returns (points, note).  The curve is the mic's own response; the tool subtracts it."""
+    import re
+    txt = open(path, encoding="utf-8", errors="replace").read()
+    if txt.lstrip().startswith("{"):
+        d = json.loads(txt)
+        return d["points"], d.get("notes", "json profile")
+    pts, header = [], []
+    for line in txt.splitlines():
+        m = re.match(r"^\s*([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)[\s,;]+(-?[0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)", line)
+        if m:
+            pts.append([float(m.group(1)), float(m.group(2))])
+        elif line.strip() and not pts:
+            header.append(line.strip())
+    if len(pts) < 5:
+        raise ValueError("no frequency/dB pairs found in " + path)
+    pts.sort()
+    # normalise to 0 dB at 1 kHz like the rest of the tool
+    import numpy as np
+    ref = float(np.interp(np.log10(1000.0), np.log10([p[0] for p in pts]), [p[1] for p in pts]))
+    pts = [[f, round(d - ref, 3)] for f, d in pts]
+    return pts, ("calibration file " + os.path.basename(path) + ("; " + " | ".join(header[:2]) if header else ""))

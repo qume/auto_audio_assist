@@ -11,7 +11,7 @@ import numpy as np
 
 from . import audio_io, signals, analysis, plots, prompts, eqexport
 from .llm import LLM
-from .session import Session, load_config, save_config, mic_profile_path
+from .session import Session, load_config, save_config, mic_profile_path, load_mic_calibration
 
 STEPS = ["1. Setup", "2. Mic profile", "3. Level check", "4. Measure", "5. Polarity", "6. Room modes", "7. Export"]
 SR = 48000
@@ -304,7 +304,7 @@ class App(tk.Tk):
         row.pack(fill="x", pady=4)
         ttk.Button(row, text="Get mic profile from LLM", command=self.get_mic_profile).pack(side="left")
         ttk.Button(row, text="Use flat (reference mic)", command=lambda: self.set_mic_profile([[20, 0], [20000, 0]], "flat")).pack(side="left", padx=4)
-        ttk.Button(row, text="Load from file...", command=self.load_mic_profile).pack(side="left")
+        ttk.Button(row, text="Load calibration file... (UMM-6 / UMIK-1 / REW txt or json)", command=self.load_mic_profile).pack(side="left")
         ttk.Button(row, text="Continue ->", command=lambda: self.show_step(2)).pack(side="right")
         self.mic_canvas = tk.Canvas(f, bg="white", height=320)
         self.mic_canvas.pack(fill="both", expand=True)
@@ -360,10 +360,11 @@ class App(tk.Tk):
         self.run_bg(work, done, "asking LLM about the mic...")
 
     def load_mic_profile(self):
-        p = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All", "*")])
+        p = filedialog.askopenfilename(filetypes=[("Calibration / profile", "*.txt *.cal *.frd *.json"), ("All", "*")])
         if p:
-            d = json.load(open(p))
-            self.set_mic_profile(d["points"], f"file: {os.path.basename(p)}")
+            pts, note = load_mic_calibration(p)
+            self.set_mic_profile(pts, note)
+            self.log(f"Loaded mic calibration ({len(pts)} points): {note}")
 
     def mic_comp(self, grid):
         if not self.mic_profile:
@@ -713,14 +714,65 @@ class App(tk.Tk):
         ttk.Button(row, text="Remove PipeWire EQ", command=self.remove_pw).pack(side="left")
         ttk.Button(row, text="LLM hand-over guidance", command=self.final_guidance).pack(side="left", padx=4)
         ttk.Button(row, text="Open session folder", command=lambda: subprocess.Popen(["xdg-open", self.session.dir])).pack(side="right")
+        # digital fixes applied in the stream (in addition to EQ)
+        fx = ttk.LabelFrame(f, text="Fix in the audio stream (applied by the PipeWire Room EQ sink, local or remote)", padding=6)
+        fx.pack(fill="x", pady=4)
+        self.fix_invert = tk.StringVar(value="none")
+        ttk.Label(fx, text="Invert polarity of:").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(fx, textvariable=self.fix_invert, values=["none", "right (channel 1)", "left (channel 0)"], state="readonly", width=18).grid(row=0, column=1, sticky="w")
+        self.fix_delay = tk.BooleanVar(value=False)
+        self.fix_delay_lbl = ttk.Checkbutton(fx, text="Time-align: delay the nearer channel", variable=self.fix_delay, command=self._refresh_6)
+        self.fix_delay_lbl.grid(row=0, column=2, sticky="w", padx=12)
+        self.fix_delay_ms = tk.StringVar(value="0.0")
+        ttk.Entry(fx, textvariable=self.fix_delay_ms, width=7).grid(row=0, column=3)
+        ttk.Label(fx, text="ms").grid(row=0, column=4, sticky="w")
+        ttk.Label(fx, text="Remote PipeWire box (ssh) and its output sink node:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.remote_target = tk.StringVar(value=self.cfg.get("remote_target_sink", "raop-marantz"))
+        ttk.Entry(fx, textvariable=self.remote_target, width=24).grid(row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Button(fx, text="Install Room EQ on remote box", command=self.install_pw_remote).grid(row=1, column=2, sticky="w", padx=12, pady=(6, 0))
+        ttk.Button(fx, text="Remove from remote box", command=self.remove_pw_remote).grid(row=1, column=3, columnspan=2, sticky="w", pady=(6, 0))
+        for c in ("fix_invert", "fix_delay", "fix_delay_ms", "remote_target"):
+            getattr(self, c).trace_add("write", lambda *a: self.after_idle(self._refresh_6))
         self.exp_text = scrolledtext.ScrolledText(f, wrap="word", font=("TkFixedFont", 9))
         self.exp_text.pack(fill="both", expand=True, pady=4)
         return f
 
+    def channel_ops(self):
+        ops = {"invert": [], "delay_ms": {}}
+        if self.fix_invert.get().startswith("right"):
+            ops["invert"].append("1")
+        elif self.fix_invert.get().startswith("left"):
+            ops["invert"].append("0")
+        if self.fix_delay.get():
+            try:
+                ms = float(self.fix_delay_ms.get())
+            except ValueError:
+                ms = 0.0
+            if self.last and ms > 0:
+                # positive arrival diff = channel 1 arrives later = channel 0 is nearer -> delay channel 0
+                diff = self.last["ev"]["polarity"]["pairs"].get("0-1", {}).get("measured_arrival_diff_ms", 0) or 0
+                ops["delay_ms"]["0" if diff > 0 else "1"] = ms
+        return ops
+
+    def _prefill_fixes(self):
+        """Suggest stream fixes from the last measurement (user can override)."""
+        if not self.last:
+            return
+        pol = self.last["ev"]["polarity"]
+        v = pol["algorithmic_verdict"].get("0-1")
+        if v == "reversed" and self.fix_invert.get() == "none":
+            self.fix_invert.set("right (channel 1)")
+        diff = abs(pol["pairs"].get("0-1", {}).get("measured_arrival_diff_ms", 0) or 0)
+        if diff >= 0.3 and self.fix_delay_ms.get() in ("0.0", ""):
+            self.fix_delay_ms.set(f"{diff:.2f}")
+
     def _refresh_6(self):
+        self._prefill_fixes()
         self.exp_text.delete("1.0", "end")
-        self.exp_text.insert("end", "FINAL CORRECTIONS\n" + eqexport.as_table(self.corrections) + "\n\nEqualizer APO / EasyEffects format:\n" +
+        ops = self.channel_ops()
+        self.exp_text.insert("end", "FINAL CORRECTIONS\n" + eqexport.as_table(self.corrections, ops) + "\n\nEqualizer APO / EasyEffects format (EQ only):\n" +
                              eqexport.as_apo(self.corrections))
+        json.dump({"channel_ops": ops}, open(self.session.path("channel_ops.json"), "w"), indent=1)
         if self.llm_json.get("final"):
             self.exp_text.insert("end", "\nLLM GUIDANCE\n" + json.dumps(self.llm_json["final"], indent=1))
         json.dump(self.corrections, open(self.session.path("corrections.json"), "w"), indent=1)
@@ -740,11 +792,48 @@ class App(tk.Tk):
         if not messagebox.askyesno("Install", f"Write {eqexport.PW_CONF_FILE} creating a 'Room EQ' sink that outputs to\n{snk['desc']}\n"
                                               "and restart PipeWire (audio will drop for a second)?"):
             return
-        p = eqexport.install_pipewire(self.corrections, snk["name"])
-        self.log(f"Installed {p}. Select 'Room EQ' as output device (or: wpctl set-default <id of aaa_room_eq_sink>).")
+        p = eqexport.install_pipewire(self.corrections, snk["name"], self.channel_ops())
+        self.log(f"Installed {p} and made 'Room EQ' the default output.")
 
     def remove_pw(self):
         self.log("Removed PipeWire EQ." if eqexport.uninstall_pipewire() else "No PipeWire EQ installed.")
+
+    def install_pw_remote(self):
+        host = self.cfg.get("remote_host", "").strip()
+        target = self.remote_target.get().strip()
+        if not host or not target:
+            messagebox.showinfo("Remote", "Set the remote ssh host in Setup and the target sink node name here.")
+            return
+        ops = self.channel_ops()
+        if not (self.corrections or ops["invert"] or ops["delay_ms"]) and not messagebox.askyesno(
+                "Nothing to correct", "No EQ, polarity or delay corrections are set. Install a transparent pass-through sink anyway?"):
+            return
+        if not messagebox.askyesno("Install on remote", f"On {host}: write the Room EQ filter chain (output -> {target}), restart its PipeWire "
+                                                        "and make Room EQ the default sink?\nAudio on that box drops for a few seconds. "
+                                                        "Bluetooth, Spotify Connect and everything else routed to the default sink will then be corrected."):
+            return
+        self.cfg["remote_target_sink"] = target
+        save_config(self.cfg)
+
+        def work():
+            return eqexport.install_pipewire_remote(host, self.corrections, target, ops)
+
+        def done(out):
+            self.log(f"Installed Room EQ on {host}:\n{out}")
+        self.run_bg(work, done, "installing EQ on remote box...")
+
+    def remove_pw_remote(self):
+        host = self.cfg.get("remote_host", "").strip()
+        target = self.remote_target.get().strip()
+        if not host:
+            return
+
+        def work():
+            return eqexport.uninstall_pipewire_remote(host, restore_default=target or None)
+
+        def done(out):
+            self.log(f"Removed Room EQ from {host}; default sink restored to {target}.")
+        self.run_bg(work, done, "removing EQ from remote box...")
 
     def final_guidance(self):
         prompt = prompts.FINAL.format(corrections=prompts.j(self.corrections), setup=self.setup_text())
