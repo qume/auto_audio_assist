@@ -153,3 +153,7 @@ python3 tests/gui_smoke.py    # drives every wizard step with simulated audio (n
 ```
 
 See [AGENTS.md](AGENTS.md) for conventions if you are extending it, human or otherwise.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
