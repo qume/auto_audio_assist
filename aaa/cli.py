@@ -59,6 +59,37 @@ def run_measurement(sink, source, sess, dist=None, dims=None, alsa=None, mic_pro
     return ev, pngs, rundir
 
 
+def run_nearfield(sink, source, sess, channel, label, alsa=None, sweep_T=5.0):
+    """One sweep on one channel, mic held ~25 cm from a single driver.  Reports the polarity of the
+    initial impulse per band so a reversed driver section can be identified without room ambiguity."""
+    rundir = sess.path("nearfield_" + "".join(c if c.isalnum() else "_" for c in label)[:40])
+    os.makedirs(rundir, exist_ok=True)
+    sig, markers, inv = signals.build_single_sweep(channel, 2, SR, sweep_T)
+    ch, fmt = alsa or (None, None)
+    mono, _ = audio_io.play_and_record(sig, sink, source, rundir, SR, 1.5, ch, fmt)
+    irs, lat, onsets, full = analysis.extract_irs(mono, markers, inv, SR, ir_len_s=0.2)
+    ir = irs["0"]
+    pol = analysis.nearfield_polarity(ir, SR)
+    grid, resp = analysis.freq_response(ir, SR, 0.05, analysis.log_grid(), 1 / 6)
+    res = {"label": label, "channel": channel, "polarity": pol,
+           "direct_sound_response": {"grid": grid.round(1).tolist(), "db": (resp - resp.max()).round(1).tolist()},
+           "peak_over_pre_noise_db": round(float(analysis.db(np.abs(ir).max()) -
+                                                 analysis.db(np.sqrt(np.mean(ir[:int(0.003 * SR)] ** 2)))), 1)}
+    json.dump(res, open(os.path.join(rundir, "nearfield.json"), "w"), indent=1, default=str)
+    np.save(os.path.join(rundir, "ir.npy"), ir)
+    sess.state.setdefault("nearfield", []).append({k: v for k, v in res.items() if k != "direct_sound_response"})
+    sess.save()
+    return res, rundir
+
+
+def nearfield_summary(res):
+    out = [f"near-field '{res['label']}' (channel {res['channel']}), IR peak {res['peak_over_pre_noise_db']} dB over noise",
+           "  view          sign  confidence   level"]
+    for view, d in res["polarity"].items():
+        out.append(f"  {view:<12} {d['sign']:+5d}  {d['confidence']:>9}  {d['level_db']:>6} dBFS")
+    return "\n".join(out)
+
+
 def summary(ev):
     pol = ev["polarity"]
     p = pol["pairs"]["0-1"]
@@ -84,6 +115,7 @@ def main():
     ap.add_argument("--label", default="")
     ap.add_argument("--mic-profile", help="json with points [[f,dB],...]")
     ap.add_argument("--llm", action="store_true", help="ask the LLM (claude CLI, fable) to review polarity")
+    ap.add_argument("--nearfield", metavar="CH", type=int, help="near-field mode: sweep only this channel (0=left)")
     a = ap.parse_args()
     sink = {"kind": "ssh" if a.sink.startswith("ssh:") else "file" if a.sink.startswith("file:") else "pw", "name": a.sink, "id": None}
     kind = "ssh" if a.source.startswith("ssh:") else "alsa" if a.source.startswith("alsa:") else "pw"
@@ -95,6 +127,11 @@ def main():
     else:
         alsa = None
     sess = Session(a.session)
+    if a.nearfield is not None:
+        res, rd = run_nearfield(sink, source, sess, a.nearfield, a.label or f"ch{a.nearfield}", alsa)
+        print(nearfield_summary(res))
+        print("saved to", rd)
+        return
     mp = json.load(open(a.mic_profile))["points"] if a.mic_profile else None
     ev, pngs, rundir = run_measurement(sink, source, sess, a.dist, a.dims, alsa, mp, a.label)
     print(summary(ev))

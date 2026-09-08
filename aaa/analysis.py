@@ -4,7 +4,7 @@ All functions are pure numpy/scipy and produce plain-dict "evidence" that is sav
 session and handed to the LLM.  Designed for N channels; the UI currently uses 2.
 """
 import numpy as np
-from scipy.signal import butter, sosfiltfilt, fftconvolve, find_peaks
+from scipy.signal import butter, sosfilt, sosfiltfilt, fftconvolve, find_peaks
 
 C_SOUND = 343.0
 
@@ -20,6 +20,20 @@ def bandpass(x, lo, hi, sr, order=4):
     hi = min(hi, nyq * 0.99)
     sos = butter(order, [lo / nyq, hi / nyq], btype="band", output="sos")
     return sosfiltfilt(sos, x)
+
+
+def lowpass_causal(x, fc, sr, order=4):
+    """Causal low-pass.  Polarity work MUST use this, never the zero-phase versions: filtfilt is
+    non-causal and puts symmetric ringing BEFORE the impulse, so the first excursion of the result
+    is filter artefact whose sign is arbitrary."""
+    sos = butter(order, fc / (sr / 2), btype="low", output="sos")
+    return sosfilt(sos, x)
+
+
+def highpass_causal(x, fc, sr, order=4):
+    """Causal high-pass - see lowpass_causal."""
+    sos = butter(order, fc / (sr / 2), btype="high", output="sos")
+    return sosfilt(sos, x)
 
 
 def lowpass(x, fc, sr, order=4):
@@ -451,4 +465,118 @@ def compare_runs(irs_prev, irs_now, sr):
         for name, band, w in (("lf_80_1200", (80.0, 1200.0), 8.0), ("mid_800_2500", (800.0, 2500.0), 4.0), ("hf_3k_10k", (3000.0, 10000.0), 2.0)):
             s, c, _ = relative_polarity(irs_prev[k], irs_now[k], sr, band=band, win_ms=w)
             out[k][name] = {"sign": s, "corr": round(c, 2)}
+    return out
+
+
+def interchannel_phase(ir_a, ir_b, sr, f_lo=100.0, f_hi=12000.0, window_s=0.006, ppo=12):
+    """Phase difference between two channels' direct sound versus frequency, in degrees.
+
+    Per-band polarity signs are ambiguous by half a cycle (at 2 kHz that is 0.25 ms), which makes
+    them unreliable for deciding WHICH driver section is reversed.  This instead takes the phase of
+    the cross-spectrum after removing the bulk delay difference, so a reversed driver section shows
+    as a band of frequencies sitting near +-180 deg while the rest sits near 0 deg.
+    """
+    n = int(window_s * sr)
+    pa = int(np.argmax(np.abs(bandpass(ir_a, 200.0, 8000.0, sr))))
+    pb = int(np.argmax(np.abs(bandpass(ir_b, 200.0, 8000.0, sr))))
+    w = np.hanning(n)
+    a = ir_a[pa: pa + n] * w
+    b = ir_b[pb: pb + n] * w
+    if len(a) < n or len(b) < n:
+        return None
+    nfft = 1 << 15
+    A = np.fft.rfft(a, nfft)
+    B = np.fft.rfft(b, nfft)
+    f = np.fft.rfftfreq(nfft, 1 / sr)
+    cross = B * np.conj(A)
+    coh = np.abs(cross) / (np.abs(A) * np.abs(B) + 1e-20)
+    grid = log_grid(f_lo, f_hi, ppo)
+    out = []
+    half = 2 ** (1 / (2 * ppo))
+    for fc in grid:
+        m = (f >= fc / half) & (f <= fc * half)
+        if not m.any():
+            continue
+        v = cross[m].sum()                      # complex average over the band
+        ph = np.degrees(np.angle(v))
+        wgt = float(np.mean(np.abs(A[m]) * np.abs(B[m])))
+        out.append([round(float(fc), 1), round(float(ph), 1), round(float(np.mean(coh[m])), 2), wgt])
+    if not out:
+        return None
+    wmax = max(r[3] for r in out)
+    pts = [[r[0], r[1], r[2], round(r[3] / wmax, 3)] for r in out]
+    # summarise: fraction of energy-weighted bands near 0 deg vs near 180 deg, per octave
+    summary = {}
+    for lo, hi, name in ((100, 700, "100-700Hz"), (700, 2000, "700-2kHz"), (2000, 5000, "2-5kHz"), (5000, 12000, "5-12kHz")):
+        sel = [r for r in pts if lo <= r[0] < hi and r[3] > 0.05]
+        if not sel:
+            continue
+        ang = np.radians([r[1] for r in sel])
+        wts = np.array([r[3] for r in sel])
+        mean_ang = np.degrees(np.angle(np.sum(wts * np.exp(1j * ang))))
+        spread = float(np.abs(np.sum(wts * np.exp(1j * ang))) / wts.sum())   # 1 = coherent, 0 = random
+        summary[name] = {"mean_phase_deg": round(float(mean_ang), 0), "consistency": round(spread, 2),
+                         "reads_as": ("same polarity" if abs(mean_ang) < 60 else
+                                      "OPPOSITE polarity" if abs(mean_ang) > 120 else "ambiguous")}
+    return {"points_f_phase_coh_weight": pts, "per_range": summary,
+            "note": "phase of channel1 relative to channel0 after removing bulk delay; ~0 deg = same polarity, "
+                    "~180 deg = opposite. 'consistency' near 1 means the reading is trustworthy."}
+
+
+def first_excursion_sign(x, sr, thresh=0.2):
+    """Sign of the FIRST significant excursion after onset, with a confidence figure.
+
+    Acoustic polarity is judged from the first movement of the cone, not from the largest peak:
+    band-pass filtering turns an impulse into a near-symmetric wavelet whose largest excursion can
+    go either way.  `confidence` is |first extremum| / |largest excursion in the arrival window|,
+    so 1.0 means the first movement is also the biggest one.
+    """
+    a = np.abs(x)
+    pk = int(np.argmax(a))
+    lim = thresh * a[pk]
+    i = pk
+    back = int(0.004 * sr)
+    while i > max(pk - back, 0) and a[i - 1] > lim:
+        i -= 1
+    j = i
+    while j + 1 < len(x) and abs(x[j + 1]) > abs(x[j]):     # walk to the first local extremum
+        j += 1
+    win = x[i: min(i + int(0.002 * sr), len(x))]
+    denom = float(np.abs(win).max()) if len(win) else 1.0
+    return int(np.sign(x[j]) or 1), round(float(abs(x[j]) / (denom + 1e-20)), 2)
+
+
+def nearfield_polarity(ir, sr):
+    """Driver polarity from a measurement taken ~25 cm from one driver.
+
+    Near-field the direct sound is ~20 dB above the room, so the first movement of the impulse is
+    unambiguous - unlike a listening-position measurement, where reflections arrive within a
+    fraction of a millisecond at treble frequencies and make per-band signs unreliable.
+
+    'broadband' is the primary reading: whichever driver the mic is pointed at dominates (at 25 cm
+    from a tweeter the HF is typically 30 dB above the bass reaching that spot).  The filtered views
+    are causal-filtered cross-checks - low-pass keeps a single-lobed pulse for a woofer or midrange,
+    high-pass isolates a tweeter - and a high-pass view is only meaningful where that driver's
+    output actually dominates, so always read 'level_db' alongside the sign.
+    """
+    out = {}
+    s, c = first_excursion_sign(ir, sr)
+    out["broadband"] = {"sign": s, "confidence": c, "level_db": round(float(db(np.abs(ir).max())), 1)}
+    for name, fn, fc in (("lowpass_400", lowpass_causal, 400.0), ("lowpass_2k", lowpass_causal, 2000.0),
+                         ("highpass_3k", highpass_causal, 3000.0), ("highpass_6k", highpass_causal, 6000.0)):
+        x = fn(ir, fc, sr)
+        s, c = first_excursion_sign(x, sr)
+        out[name] = {"sign": s, "confidence": c, "level_db": round(float(db(np.abs(x).max())), 1)}
+    return out
+
+
+def compare_nearfield(a, b):
+    """Compare two near-field results (e.g. left vs right speaker at the same driver, or tweeter vs
+    woofer position on one speaker).  Returns per-view agreement."""
+    out = {}
+    for k in a:
+        if k in b:
+            out[k] = {"same_polarity": a[k]["sign"] == b[k]["sign"],
+                      "signs": [a[k]["sign"], b[k]["sign"]],
+                      "confidence": round(min(a[k]["confidence"], b[k]["confidence"]), 2)}
     return out

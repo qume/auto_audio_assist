@@ -105,3 +105,30 @@ def build_measurement(channels=2, sr=SR, sweep_T=5.0, level_db=-12.0, gap=1.0, p
     sig = np.concatenate(segs)
     markers["total_len"] = len(sig)
     return sig, markers, inv
+
+
+def build_single_sweep(channel, channels=2, sr=SR, sweep_T=5.0, level_db=-12.0, pre=0.5, gap=1.0,
+                       warmup_T=2.0):
+    """One sweep on one channel, for near-field per-driver measurements.
+    Returns (signal, markers, inverse filter) in the same shape `analysis.extract_irs` expects."""
+    sweep, inv = ess(T=sweep_T, sr=sr)
+    amp = 10 ** (level_db / 20)
+    g = int(gap * sr)
+    segs = [np.zeros((int(pre * sr), channels), np.float32)]
+    pos = int(pre * sr)
+    markers = {"sr": sr, "sweep_len": len(sweep), "channels": channels, "sweeps": {}, "bursts": []}
+    if warmup_T > 0:
+        wu = band_noise(warmup_T, 60.0, 6000.0, sr=sr, seed=7) * amp
+        blk = np.zeros((len(wu) + g, channels), np.float32)
+        blk[: len(wu), channel] = wu
+        markers["warmup"] = {"start": pos, "len": len(wu)}
+        segs.append(blk)
+        pos += len(blk)
+    blk = np.zeros((len(sweep) + g, channels), np.float32)
+    blk[: len(sweep), channel] = sweep * amp
+    markers["sweeps"]["0"] = pos            # '0' so extract_irs uses it as the reference sweep
+    segs.append(blk)
+    pos += len(blk)
+    sig = np.concatenate(segs)
+    markers["total_len"] = len(sig)
+    return sig, markers, inv
