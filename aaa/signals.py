@@ -50,13 +50,18 @@ def pink_noise(T, sr=SR, seed=99):
 
 
 def build_measurement(channels=2, sr=SR, sweep_T=5.0, level_db=-12.0, gap=1.0, pre=0.5,
-                      bursts=4, burst_T=1.5, burst_gap=0.5, lf_band=(40.0, 150.0)):
+                      bursts=4, burst_T=1.5, burst_gap=0.5, lf_band=(40.0, 150.0), warmup_T=3.0):
     """Multichannel test sequence.
 
     Layout (all offsets in samples are returned in `markers`):
-      pre-silence | sweep ch0 | gap | sweep ch1 | gap ... | sweep all-in-phase | gap |
+      pre-silence | warm-up noise (all channels) | gap |
+      sweep ch0 | gap | sweep ch1 | gap ... | sweep all-in-phase | gap |
       LF bursts: [all channels in phase] gap [ch0 in phase, others inverted] gap  x bursts
     Returns (stereo/multichannel float32 array, markers dict, inverse sweep filter).
+
+    The warm-up matters: amplifiers, AV receivers and network renderers (AirPlay/RAOP, Chromecast)
+    mute or ramp for up to a second after a stream starts, which would silently swallow the low
+    frequencies of whichever sweep came first.  Leading with silence does NOT wake them.
     """
     sweep, inv = ess(T=sweep_T, sr=sr)
     amp = 10 ** (level_db / 20)
@@ -65,6 +70,14 @@ def build_measurement(channels=2, sr=SR, sweep_T=5.0, level_db=-12.0, gap=1.0, p
     markers = {"sr": sr, "sweep_len": len(sweep), "channels": channels, "sweeps": {}, "bursts": []}
     pos = int(pre * sr)
     segs.append(np.zeros((pos, channels), np.float32))
+    if warmup_T > 0:
+        wu = band_noise(warmup_T, 60.0, 6000.0, sr=sr, seed=7) * amp
+        blk = np.zeros((len(wu) + g, channels), np.float32)
+        for ch in range(channels):
+            blk[: len(wu), ch] = wu
+        markers["warmup"] = {"start": pos, "len": len(wu)}
+        segs.append(blk)
+        pos += len(blk)
     for ch in range(channels):
         blk = np.zeros((len(sweep) + g, channels), np.float32)
         blk[: len(sweep), ch] = sweep * amp

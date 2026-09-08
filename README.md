@@ -49,8 +49,11 @@ at the bottom where you can ask questions in context at any time.
 3. **Level check** — noise floor, pink noise, per-band signal-to-noise. Judged relative to your
    room's noise so an insensitive laptop mic is fine. **Identify channels** plays the LEFT channel
    only so you can confirm by ear which speaker is which.
-4. **Measure** — about 40 s: sweep left, sweep right, sweep both, then alternating in-phase /
-   anti-phase 40–150 Hz noise bursts. Deconvolution yields one impulse response per speaker.
+4. **Measure** — about 40 s: a warm-up burst, then sweep left, sweep right, sweep both, then
+   alternating in-phase / anti-phase 40–150 Hz noise bursts. Deconvolution yields one impulse
+   response per speaker. The warm-up is not optional padding: AV receivers and network renderers
+   mute or ramp for up to a second after a stream starts, which silently swallows the low end of
+   whichever sweep comes first, and leading with silence does not wake them.
 5. **Polarity** — verdicts and the evidence behind them, with an LLM review on request. Change a
    wire, re-measure, and the run comparison table shows what changed.
 6. **Room modes** — peaks against a one-octave trend, matched to the axial modes predicted from
@@ -71,6 +74,7 @@ at the bottom where you can ask questions in context at any time.
 | Burst test | In-phase vs anti-phase 40–150 Hz bursts | needs a roughly centred mic |
 | Crossover notch | Dip in each speaker's direct-sound response between 800 Hz and 8 kHz | identifies which speaker has a reversed HF section |
 | Run-to-run comparison | Which channel and which band flipped since the previous run | pins the culprit after a wiring change |
+| Sweep level check | Band levels taken straight from the recording during each sweep | independent of IR extraction; catches a muting receiver or dynamic EQ before they mislead a verdict |
 
 Whole-speaker reversal flips all three bands and the sum test. A reversed tweeter/mid section
 flips only the upper bands while the bass tests stay positive.
@@ -87,6 +91,10 @@ The source computer is often nowhere near the amplifier. Setup offers:
   played with `pw-play`). *Install system-wide sink for it* creates a PipeWire sink "Amp via host"
   plus a user service that streams it over ssh, so the remote box becomes an ordinary system output
 - **manual / sneakernet**: export the test WAV, play it from anything, the app only records
+
+The **microphone** can also live on the remote box (`ssh:user@host:hw:CARD,DEV`), which is the
+natural arrangement when a USB measurement mic reaches further than the computer does. Remote
+captures run for a fixed duration and stream back over ssh.
 
 Playback latency does not matter. The analysis finds the first sweep wherever it lands in the
 recording, and relative timing between channels is preserved because everything is one file.

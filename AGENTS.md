@@ -33,7 +33,7 @@ evidence for an LLM to review at each stage. Read `README.md` first, then `aaa/a
 |---|---|---|
 | `aaa/signals.py` | stimulus generation, marker layout | any I/O |
 | `aaa/analysis.py` | deconvolution, IR extraction, polarity tests, room modes, run comparison, corrections | Tk, subprocess, file paths |
-| `aaa/audio_io.py` | device lists, play/record (PipeWire, ALSA, ssh, manual), remote sink install | DSP |
+| `aaa/audio_io.py` | device lists, play/record (PipeWire, ALSA local + remote over ssh, manual), remote sink install | DSP |
 | `aaa/llm.py` | backends, logging, JSON extraction | prompt wording |
 | `aaa/prompts.py` | prompt templates and the system prompt | code that runs |
 | `aaa/plots.py` | Tk canvas plotting, matplotlib PNGs for the LLM | analysis decisions |
@@ -89,6 +89,17 @@ python3 tests/gui_smoke.py    # needs a display; drives all 7 steps with simulat
 
 There is no audio hardware in CI. Anything touching real devices should degrade to a clear error,
 not a hang: recorders use SIGINT with timeouts, ssh uses `BatchMode=yes` and `ConnectTimeout`.
+
+## Self-checks that must stay
+
+- `analysis.lf_sum_test` marks itself `invalid` above +3.5 dB. Coherent summation of two sources
+  cannot exceed +3 dB over their power sum, so a higher figure proves the playback gain changed
+  between sweeps. It is then excluded from the verdict vote — do not "fix" this by raising the
+  threshold.
+- `analysis.sweep_level_check` measures band levels from the raw recording during each sweep,
+  bypassing IR extraction entirely. It exists because an AV receiver that unmutes ~1 s into a
+  stream removes the low end of the first sweep only, which looks exactly like a dead woofer.
+  The warm-up burst in `signals.build_measurement` is the countermeasure; keep both.
 
 ## Things that look like bugs but aren't
 

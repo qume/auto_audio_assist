@@ -32,8 +32,25 @@ def list_sinks():
     return res
 
 
-def list_sources():
-    """PipeWire sources plus raw ALSA capture devices (prefixed 'alsa:')."""
+def list_remote_sources(host, timeout=25):
+    """ALSA capture devices on a remote box, as 'ssh:<host>:hw:CARD,DEV' sources."""
+    if not host:
+        return []
+    try:
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "arecord -l"],
+                             capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return []
+    res = []
+    for m in re.finditer(r"card (\d+): (\S+) \[([^\]]+)\], device (\d+): ([^\[]+)\[", out):
+        card, cid, cname, dev, dname = m.groups()
+        res.append({"id": None, "name": f"ssh:{host}:hw:{cid},{dev}", "kind": "ssh",
+                    "desc": f"Remote mic on {host}: {cname.strip()} / {dname.strip()}"})
+    return res
+
+
+def list_sources(remote_host=""):
+    """PipeWire sources, raw local ALSA devices ('alsa:'), and remote ALSA devices ('ssh:')."""
     res = []
     for o in _pw_nodes():
         p = o.get("info", {}).get("props", {})
@@ -46,6 +63,7 @@ def list_sources():
             res.append({"id": None, "name": f"alsa:hw:{cid},{dev}", "desc": f"ALSA raw: {cname} / {dname.strip()}", "kind": "alsa"})
     except Exception:
         pass
+    res += list_remote_sources(remote_host)
     return res
 
 
@@ -73,56 +91,101 @@ def write_wav(path, data, sr=SR):
     w.write(path, sr, data.astype(np.float32))
 
 
+ALSA_FORMAT = {"f32": "FLOAT_LE", "s32": "S32_LE", "s24_3": "S24_3LE", "s16": "S16_LE"}
+SAMPLE_BYTES = {"f32": 4, "s32": 4, "s24_3": 3, "s16": 2}
+
+
 def read_wav_robust(path, channels, fmt):
-    """Read a possibly-truncated WAV written by arecord/pw-record. fmt: 'f32' | 's32' | 's16'."""
+    """Read a possibly-truncated WAV or headerless raw capture written by arecord/pw-record.
+    fmt: 'f32' | 's32' | 's24_3' (24-bit packed) | 's16'."""
     b = open(path, "rb").read()
     i = b.find(b"data")
-    raw = b[i + 8:] if i >= 0 else b
-    dt = {"f32": "<f4", "s32": "<i4", "s16": "<i2"}[fmt]
-    x = np.frombuffer(raw[: len(raw) - len(raw) % (np.dtype(dt).itemsize * channels)], dtype=dt)
-    x = x.reshape(-1, channels).astype(np.float64)
-    if fmt == "s32":
-        x /= 2 ** 31
-    elif fmt == "s16":
-        x /= 2 ** 15
-    x = x[np.isfinite(x).all(axis=1)]
-    return x
+    raw = b[i + 8:] if (i >= 0 and b[:4] == b"RIFF") else b
+    fs = SAMPLE_BYTES[fmt] * channels
+    raw = raw[: len(raw) - len(raw) % fs]
+    if fmt == "s24_3":
+        a = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        v = a[:, 0] | (a[:, 1] << 8) | (a[:, 2] << 16)
+        v = np.where(v & 0x800000, v - (1 << 24), v)
+        x = v.reshape(-1, channels).astype(np.float64) / 2 ** 23
+    else:
+        dt = {"f32": "<f4", "s32": "<i4", "s16": "<i2"}[fmt]
+        x = np.frombuffer(raw, dtype=dt).reshape(-1, channels).astype(np.float64)
+        if fmt == "s32":
+            x /= 2 ** 31
+        elif fmt == "s16":
+            x /= 2 ** 15
+    return x[np.isfinite(x).all(axis=1)]
 
 
 class Recorder:
-    """Background recorder.  source: {'kind': 'pw'|'alsa', 'name': ...}."""
+    """Background recorder.  source kinds:
+      'pw'   local PipeWire node          -> pw-record
+      'alsa' local ALSA device            -> arecord
+      'ssh'  ALSA device on a remote box  -> ssh host arecord, streamed back to a local file
 
-    def __init__(self, source, path, sr=SR, alsa_channels=None, alsa_format=None):
+    Remote captures run for a fixed `duration` (seconds): killing an ssh client does not reliably
+    kill the remote process, and every stage of this tool knows how long it needs to record.
+    """
+
+    def __init__(self, source, path, sr=SR, alsa_channels=None, alsa_format=None, duration=None):
         self.source, self.path, self.sr = source, path, sr
         self.kind = source.get("kind", "pw")
-        self.channels = 1
-        self.fmt = "f32"
+        self.channels, self.fmt = 1, "f32"
+        self.duration = duration
+        self.out = None
         if self.kind == "alsa":
             dev = source["name"].split("alsa:", 1)[1]
             self.channels = alsa_channels or probe_alsa_channels(dev)
             self.fmt = alsa_format or "s32"
-            afmt = {"f32": "FLOAT_LE", "s32": "S32_LE", "s16": "S16_LE"}[self.fmt]
-            self.cmd = ["arecord", "-q", "-D", dev, "-c", str(self.channels), "-r", str(sr), "-f", afmt, path]
+            self.cmd = ["arecord", "-q", "-D", dev, "-c", str(self.channels), "-r", str(sr),
+                        "-f", ALSA_FORMAT[self.fmt], path]
+        elif self.kind == "ssh":
+            host, dev = _ssh_parts(source["name"])
+            self.channels = alsa_channels or 2
+            self.fmt = alsa_format or "s24_3"
+            if not duration:
+                raise ValueError("remote (ssh) capture needs a duration")
+            remote = (f"arecord -q -D {dev} -c {self.channels} -r {sr} -f {ALSA_FORMAT[self.fmt]} "
+                      f"-t raw -d {int(np.ceil(duration))} -")
+            self.cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote]
         else:
             self.cmd = ["pw-record", "--target", str(source.get("id") or source["name"]), "--rate", str(sr),
                         "--channels", "1", "--format", "f32", path]
         self.proc = None
 
     def start(self):
-        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        time.sleep(0.4)
+        if self.kind == "ssh":
+            self.out = open(self.path, "wb")
+            self.proc = subprocess.Popen(self.cmd, stdout=self.out, stderr=subprocess.PIPE)
+            time.sleep(1.2)          # ssh handshake + arecord opening the device
+        else:
+            self.proc = subprocess.Popen(self.cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            time.sleep(0.4)
         if self.proc.poll() is not None:
-            raise RuntimeError("recorder failed: " + self.proc.stderr.read().decode(errors="replace"))
+            raise RuntimeError("recorder failed: " + self.proc.stderr.read().decode(errors="replace")[-400:])
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGINT)
-            try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+            if self.kind == "ssh":
+                # the remote arecord stops on its own; wait for it, then fall back to killing ssh
+                try:
+                    self.proc.wait(timeout=(self.duration or 0) + 15)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+            else:
+                self.proc.send_signal(signal.SIGINT)
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+        err = self.proc.stderr.read().decode(errors="replace") if self.proc and self.proc.stderr else ""
+        if self.out:
+            self.out.close()
         time.sleep(0.2)
         x = read_wav_robust(self.path, self.channels, self.fmt)
+        if len(x) < self.sr // 2:
+            raise RuntimeError(f"capture produced only {len(x)} frames. {err[-400:]}")
         return x
 
 
@@ -134,6 +197,22 @@ def probe_alsa_channels(dev):
         return int(m.group(1)) if m else 2
     except Exception:
         return 2
+
+
+def probe_remote_alsa(host, dev, timeout=25):
+    """(channels, fmt) for an ALSA capture device on a remote box, from arecord --dump-hw-params."""
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+                        f"arecord -D {dev} --dump-hw-params -d 1 /dev/null"],
+                       capture_output=True, text=True, timeout=timeout)
+    out = r.stdout + r.stderr
+    m = re.search(r"CHANNELS:\s*\[?(\d+)", out)
+    ch = int(m.group(1)) if m else 2
+    fmts = re.search(r"FORMAT:\s*(.+)", out)
+    have = fmts.group(1).split() if fmts else []
+    for key, name in (("f32", "FLOAT_LE"), ("s32", "S32_LE"), ("s24_3", "S24_3LE"), ("s16", "S16_LE")):
+        if name in have:
+            return ch, key
+    return ch, "s16"
 
 
 def probe_alsa_format(source, sr=SR):
@@ -158,7 +237,8 @@ def probe_alsa_format(source, sr=SR):
 
 def record_only(source, seconds, workdir, sr=SR, alsa_channels=None, alsa_format=None):
     os.makedirs(workdir, exist_ok=True)
-    rec = Recorder(source, os.path.join(workdir, "noise_floor.wav"), sr, alsa_channels, alsa_format)
+    rec = Recorder(source, os.path.join(workdir, "noise_floor.wav"), sr, alsa_channels, alsa_format,
+                   duration=seconds)
     rec.start()
     time.sleep(seconds)
     x = rec.stop()
@@ -224,10 +304,12 @@ def play_and_record(signal_stereo, sink, source, workdir, sr=SR, tail_s=1.5, als
     stim = os.path.join(workdir, "stimulus.wav")
     recp = os.path.join(workdir, "recording_raw.wav")
     write_wav(stim, signal_stereo, sr)
-    rec = Recorder(source, recp, sr, alsa_channels, alsa_format)
+    dur = len(signal_stereo) / sr
+    # remote captures are fixed-length: cover playback plus network-renderer buffering and the tail
+    extra = (manual_wait_s or 15.0) if sink.get("kind") == "file" else max(tail_s, 5.0) + 4.0
+    rec = Recorder(source, recp, sr, alsa_channels, alsa_format, duration=dur + extra)
     rec.start()
     t0 = time.time()
-    dur = len(signal_stereo) / sr
     p = play(stim, sink, blocking=False)
     if p is None:  # manual mode
         total = dur + (manual_wait_s or 15.0)

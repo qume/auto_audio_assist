@@ -199,10 +199,62 @@ def lf_sum_test(irs, sr, f_lo=25.0, f_hi=70.0):
     singles = [resp[k][m] for k in irs if k != "all"]
     psum = 10 * np.log10(np.sum([10 ** (r / 10) for r in singles], axis=0))
     diff = resp["all"][m] - psum
-    return {"band_hz": [f_lo, f_hi], "all_minus_power_sum_db_mean": round(float(np.mean(diff)), 1),
-            "all_minus_power_sum_db_median": round(float(np.median(diff)), 1),
-            "per_freq": [[round(float(f), 1), round(float(d), 1)] for f, d in zip(grid[m], diff)],
-            "expected_if_in_phase_db": "about +3 (range 0..+3)", "expected_if_reversed_db": "well below -3"}
+    med = float(np.median(diff))
+    out = {"band_hz": [f_lo, f_hi], "all_minus_power_sum_db_mean": round(float(np.mean(diff)), 1),
+           "all_minus_power_sum_db_median": round(med, 1),
+           "per_freq": [[round(float(f), 1), round(float(d), 1)] for f, d in zip(grid[m], diff)],
+           "expected_if_in_phase_db": "about +3 (range 0..+3)", "expected_if_reversed_db": "well below -3"}
+    if med > 3.5:
+        out["invalid"] = ("exceeds the +3 dB physical maximum for coherent summation, so playback gain was NOT "
+                          "constant across the sweeps (receiver unmuting/relocking at the start of the stream, "
+                          "dynamic EQ or dynamic volume, or a network renderer ramping up). Result discarded.")
+    return out
+
+
+def sweep_level_check(rec, markers, latency, sr, sweep_T=None, f1=20.0, f2=20000.0):
+    """Band levels measured straight from the recording during each sweep, bypassing IR extraction.
+
+    An exponential sweep visits each frequency at a known time, so this is an independent check that
+    every sweep was actually reproduced at the same gain.  Catches receivers that mute or ramp at the
+    start of a stream (which would swallow the low end of whichever sweep came first) and any
+    level-dependent processing in the amplifier.
+    """
+    L = markers["sweep_len"]
+    T = (sweep_T or L / sr)
+    R = np.log(f2 / f1)
+    bands = [(25.0, 60.0), (60.0, 125.0), (125.0, 500.0), (500.0, 2000.0), (2000.0, 8000.0)]
+    per = {}
+    for key, start in markers["sweeps"].items():
+        s0 = start + latency
+        row = {}
+        for lo, hi in bands:
+            a = s0 + int(T / R * np.log(lo / f1) * sr)
+            b = s0 + int(T / R * np.log(hi / f1) * sr)
+            if b > len(rec) or a < 0 or b - a < 128:
+                row[f"{lo:.0f}-{hi:.0f}"] = None
+                continue
+            row[f"{lo:.0f}-{hi:.0f}"] = round(float(db(np.sqrt(np.mean(bandpass(rec[a:b], lo, hi, sr) ** 2)))), 1)
+        per[key] = row
+    out = {"per_sweep_band_db": per, "warnings": []}
+    singles = [k for k in per if k != "all"]
+    for band in per[singles[0]]:
+        vals = {k: per[k][band] for k in singles if per[k][band] is not None}
+        if len(vals) < 2:
+            continue
+        spread = max(vals.values()) - min(vals.values())
+        if spread > 12.0:
+            lo_ch = min(vals, key=vals.get)
+            out["warnings"].append(
+                f"{band} Hz differs by {spread:.0f} dB between channels (lowest: channel {lo_ch}). "
+                "If that channel's sweep came first, the receiver was probably still muted or ramping; "
+                "otherwise suspect a driver, a modal null, or level-dependent processing.")
+        if per.get("all", {}).get(band) is not None:
+            psum = 10 * np.log10(sum(10 ** (v / 10) for v in vals.values()))
+            d = per["all"][band] - psum
+            if d > 3.5:
+                out["warnings"].append(f"{band} Hz: all-channels sweep is {d:+.1f} dB above the power sum of the "
+                                       "single sweeps, which is impossible at constant gain.")
+    return out
 
 
 def polarity_evidence(irs, onsets, rec, markers, latency, sr, distances=None):
@@ -234,6 +286,8 @@ def polarity_evidence(irs, onsets, rec, markers, latency, sr, distances=None):
                                  "measured_arrival_diff_ms": round(onsets[k], 2),
                                  "expected_arrival_diff_ms_from_distances": exp_lag}
     ev["burst_test"] = burst_test(rec, markers, latency, sr)
+    ev["sweep_level_check"] = sweep_level_check(rec, markers, latency, sr)
+    ev["notes"] += ev["sweep_level_check"]["warnings"]
     # L/R channel swap check: the user's distances predict which speaker's sound arrives first
     if distances and len(distances) >= 2:
         exp = (distances[1] - distances[0]) / C_SOUND * 1000.0
@@ -263,7 +317,7 @@ def polarity_evidence(irs, onsets, rec, markers, latency, sr, distances=None):
                 and bt.get("path_difference_m", 0) <= 0.4:
             votes.append(1 if bt["diff_db"] > 0 else -1)
         st = ev["lf_sum_test"]
-        if st and len(chans) == 2:
+        if st and not st.get("invalid") and len(chans) == 2:
             d = st["all_minus_power_sum_db_median"]
             if d >= 0.0:
                 votes.append(1)

@@ -77,7 +77,7 @@ def summary(ev):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sink", required=True, help="pw sink name, ssh:user@host:dev, or file:manual")
-    ap.add_argument("--source", required=True, help="pw source name or alsa:hw:X,Y")
+    ap.add_argument("--source", required=True, help="pw source name, alsa:hw:X,Y, or ssh:user@host:hw:X,Y")
     ap.add_argument("--dist", nargs=2, type=float, help="mic distance to L and R speaker (m)")
     ap.add_argument("--dims", nargs=3, type=float, help="room L W H (m)")
     ap.add_argument("--session", help="session directory (reuse to append runs)")
@@ -86,8 +86,14 @@ def main():
     ap.add_argument("--llm", action="store_true", help="ask the LLM (claude CLI, fable) to review polarity")
     a = ap.parse_args()
     sink = {"kind": "ssh" if a.sink.startswith("ssh:") else "file" if a.sink.startswith("file:") else "pw", "name": a.sink, "id": None}
-    source = {"kind": "alsa" if a.source.startswith("alsa:") else "pw", "name": a.source, "id": None}
-    alsa = audio_io.probe_alsa_format(source) if source["kind"] == "alsa" else None
+    kind = "ssh" if a.source.startswith("ssh:") else "alsa" if a.source.startswith("alsa:") else "pw"
+    source = {"kind": kind, "name": a.source, "id": None}
+    if kind == "ssh":
+        alsa = audio_io.probe_remote_alsa(*audio_io._ssh_parts(a.source))
+    elif kind == "alsa":
+        alsa = audio_io.probe_alsa_format(source)
+    else:
+        alsa = None
     sess = Session(a.session)
     mp = json.load(open(a.mic_profile))["points"] if a.mic_profile else None
     ev, pngs, rundir = run_measurement(sink, source, sess, a.dist, a.dims, alsa, mp, a.label)

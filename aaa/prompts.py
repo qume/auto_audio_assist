@@ -49,6 +49,11 @@ responses (IRs) were obtained by deconvolution, direct-sound onsets aligned per 
 'burst_test.diff_db' is LF level of in-phase bursts minus anti-phase bursts (positive = in phase,
 only meaningful if the mic is roughly equidistant from both speakers).
 'crossover_notch' is a dip in the short-window (direct sound) response between 800 Hz and 8 kHz.
+'lf_sum_test' compares the all-channels sweep with the power sum of the single sweeps at 25-70 Hz:
+about +3 dB means in phase, well below -3 dB means reversed.  If it carries an 'invalid' field the
+playback gain was not constant and it has already been discarded - say so rather than using it.
+'sweep_level_check' measures band levels straight from the recording during each sweep, bypassing
+IR extraction; use it to judge whether every sweep was actually reproduced at the same gain.
 Arrival time differences let you sanity-check that the correct direct sound was found.
 
 Evidence (JSON):

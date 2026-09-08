@@ -171,7 +171,7 @@ class App(tk.Tk):
         self.sink_cb.grid(row=r, column=1, sticky="we")
         ttk.Button(f, text="Set as system default", command=self.make_default).grid(row=r, column=2, padx=4)
         r += 1
-        ttk.Label(f, text="Remote box (ssh user@host) with ALSA device:").grid(row=r, column=0, sticky="w")
+        ttk.Label(f, text="Remote box (ssh user@host) + its output device:").grid(row=r, column=0, sticky="w")
         rrow = ttk.Frame(f)
         rrow.grid(row=r, column=1, sticky="we")
         self.vars["remote_host"] = tk.StringVar(value=self.cfg.get("remote_host", ""))
@@ -226,8 +226,9 @@ class App(tk.Tk):
         self.refresh_devices()
 
     def refresh_devices(self):
-        self.sinks = audio_io.output_options(self.vars["remote_host"].get().strip(), self.vars["remote_dev"].get().strip())
-        self.sources = audio_io.list_sources()
+        host = self.vars["remote_host"].get().strip()
+        self.sinks = audio_io.output_options(host, self.vars["remote_dev"].get().strip())
+        self.sources = audio_io.list_sources(host)
         self.sink_cb["values"] = [f"{s['desc']}  [{s['name']}]" for s in self.sinks]
         self.src_cb["values"] = [f"{s['desc']}  [{s['name']}]" for s in self.sources]
         cur = audio_io.default_sink_name()
@@ -282,16 +283,21 @@ class App(tk.Tk):
         self.session.state["config"] = {k: v for k, v in self.cfg.items() if k != "llm_key"}
         self.session.save()
         src = self.source()
-        if src and src["kind"] == "alsa":
+        if src and src["kind"] in ("alsa", "ssh"):
             def probe():
+                if src["kind"] == "ssh":
+                    host, dev = audio_io._ssh_parts(src["name"])
+                    return audio_io.probe_remote_alsa(host, dev)
                 return audio_io.probe_alsa_format(src)
 
             def done(res):
                 self._alsa_ch, self._alsa_fmt = res
-                self.log(f"Raw ALSA mic: {res[0]} channel(s), sample format {res[1]} (auto-detected). Capsule 0 is used.")
+                where = "Remote" if src["kind"] == "ssh" else "Local"
+                self.log(f"{where} ALSA mic: {res[0]} channel(s), sample format {res[1]} (auto-detected). Channel 0 is used.")
                 self.show_step(1)
             self.run_bg(probe, done, "probing mic format...")
         else:
+            self._alsa_ch = self._alsa_fmt = None
             self.show_step(1)
 
     # ------------------------------------------------------------------ step 2: mic profile
@@ -324,8 +330,11 @@ class App(tk.Tk):
         if "j415-mic" in src or "effect_output" in src:
             return ("Asahi Linux processed mic: 3-capsule beamformer, +36 dB gain and a 2nd-order 120 Hz high-pass "
                     "(the tool compensates the high-pass analytically; do NOT include it in your curve).")
+        if src.startswith("ssh:"):
+            return ("Raw ALSA capture of a USB microphone on a remote Linux box, no processing. "
+                    "If this is a calibrated measurement mic, load its calibration file instead of guessing.")
         if src.startswith("alsa:"):
-            return "Raw ALSA capture of the internal mic array, no processing, capsules averaged."
+            return "Raw ALSA capture of the internal mic array, no processing, channel 0 used."
         return "Standard PipeWire source."
 
     def set_mic_profile(self, points, note=""):
