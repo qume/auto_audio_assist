@@ -65,13 +65,31 @@ def smooth_response(freqs, mag_db, grid, octaves):
     return out
 
 
-def freq_response(ir, sr, window_s=0.5, grid=None, octaves=1 / 6):
-    """IR -> smoothed magnitude response (dB) on a log grid."""
+def freq_response(ir, sr, window_s=0.5, grid=None, octaves=1 / 6, start=None):
+    """IR -> smoothed magnitude response (dB) on a log grid.
+
+    The window starts at the direct-sound arrival, not at sample 0: `extract_irs` deliberately keeps
+    a few ms of pre-roll ahead of the impulse, so a short gate applied from sample 0 would measure
+    the pre-arrival noise and nothing else.  Pass `start` to override the detected onset.
+
+    A short window (5-10 ms) gives a quasi-anechoic view - the speaker with the room's reflections
+    excluded - valid only above roughly 1/window (a 5 ms gate is meaningless below ~250 Hz).  A long
+    window (0.5 s) gives the steady-state in-room response.
+    """
     n = int(window_s * sr)
-    seg = ir[:n].copy()
-    fade = int(0.02 * sr)
-    if len(seg) > fade:
-        seg[-fade:] *= np.linspace(1, 0, fade)
+    if start is None:
+        a = np.abs(ir)
+        pk = int(np.argmax(a))
+        start = pk
+        back = int(0.003 * sr)
+        while start > max(pk - back, 0) and a[start - 1] > 0.25 * a[pk]:
+            start -= 1
+        start = max(start - int(0.0005 * sr), 0)     # keep 0.5 ms of lead-in
+    seg = ir[start: start + n].copy()
+    if len(seg) < n:
+        seg = np.pad(seg, (0, n - len(seg)))
+    fade = min(int(0.02 * sr), max(len(seg) // 5, 1))
+    seg[-fade:] *= np.linspace(1, 0, fade)
     nfft = max(1 << (len(seg) - 1).bit_length(), 1 << 15)
     X = np.fft.rfft(seg, nfft)
     f = np.fft.rfftfreq(nfft, 1 / sr)

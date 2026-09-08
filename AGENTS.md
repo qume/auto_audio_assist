@@ -107,6 +107,13 @@ not a hang: recorders use SIGINT with timeouts, ssh uses `BatchMode=yes` and `Co
 - Filtering for polarity must be **causal** (`lowpass_causal` / `highpass_causal`). `sosfiltfilt`
   is zero-phase and puts ringing before the impulse, making a first-excursion sign meaningless.
 
+## Windowing
+
+`extract_irs` keeps ~5 ms of pre-roll ahead of the impulse, so `freq_response` finds the onset and
+windows from there. A gate applied from sample 0 measures pre-arrival noise (this was a real bug -
+it produced a +20 dB treble rise). A short gate (5-10 ms) is quasi-anechoic, i.e. the speaker with
+the room excluded, and is only valid above roughly 1/window; a 0.5 s gate is the in-room response.
+
 ## Self-checks that must stay
 
 - `analysis.lf_sum_test` marks itself `invalid` above +3.5 dB. Coherent summation of two sources
