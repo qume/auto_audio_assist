@@ -299,6 +299,8 @@ def polarity_evidence(irs, onsets, rec, markers, latency, sr, distances=None):
                                  "relative_sign_hf_3k_10k": hs, "correlation_hf": round(hc, 3),
                                  "measured_arrival_diff_ms": round(onsets[k], 2),
                                  "expected_arrival_diff_ms_from_distances": exp_lag}
+    for k in chans[1:]:
+        ev["pairs"][f"0-{k}"]["phase_vs_frequency"] = interchannel_phase(irs["0"], irs[k], sr)
     ev["burst_test"] = burst_test(rec, markers, latency, sr)
     ev["sweep_level_check"] = sweep_level_check(rec, markers, latency, sr)
     ev["notes"] += ev["sweep_level_check"]["warnings"]
@@ -347,29 +349,53 @@ def polarity_evidence(irs, onsets, rec, markers, latency, sr, distances=None):
             verdict[f"0-{k}"] = "conflicting"
             ev["notes"].append("Indicators disagree. Most reliable resolution: swap + and - on ONE speaker, re-measure, "
                                "and keep the wiring that gives the higher LF sum test and burst test values.")
-    # tweeter/woofer consistency: LF band agreement vs HF band agreement between channel pairs
+    # Driver-section polarity from the phase-vs-frequency curve, NOT from per-band signs: a per-band
+    # sign is ambiguous by half a cycle (0.25 ms at 2 kHz), and at a listening position reflections
+    # arrive inside that window.  A genuinely reversed section instead holds ~180 deg across octaves,
+    # which no timing error can imitate.  Anything less than coherent is reported as inconclusive and
+    # sent to the near-field check rather than guessed at.
+    MIN_CONS = 0.6
     notch = {k: ev["channels"][k]["crossover_notch"] for k in chans}
     tw = {k: "ok" for k in chans}
     for k in chans[1:]:
-        p = ev["pairs"][f"0-{k}"]
-        if p["correlation"] > 0.3 and p["correlation_hf"] > 0.3 and p["relative_sign"] != p["relative_sign_hf_3k_10k"]:
-            # one speaker's tweeter is wired opposite to the other's.  Which one?  The one with the
-            # deeper crossover notch is the likelier culprit; otherwise report both as suspect.
+        ph = ev["pairs"][f"0-{k}"].get("phase_vs_frequency")
+        pr = (ph or {}).get("per_range", {})
+        lows = [v for name, v in pr.items() if name in ("100-700Hz",)]
+        highs = [v for name, v in pr.items() if name in ("700-2kHz", "2-5kHz", "5-12kHz")]
+        usable_low = [v for v in lows if v["consistency"] >= MIN_CONS]
+        usable_high = [v for v in highs if v["consistency"] >= MIN_CONS]
+        # one range on its own is too easy to fool: require two that agree before calling a fault
+        if not usable_low or len(usable_high) < 2:
+            msg = ("inconclusive: inter-channel phase is not coherent enough at this microphone "
+                   "position to judge driver sections. Measure near-field (~25 cm from each driver, "
+                   "one speaker at a time) to settle it.")
+            tw["0"] = tw[k] = msg
+            ev["notes"].append(f"Driver-section polarity between channels 0 and {k} is {msg}")
+            continue
+        low_same = all(abs(v["mean_phase_deg"]) < 60 for v in usable_low)
+        high_opp = all(abs(v["mean_phase_deg"]) > 120 for v in usable_high)
+        high_same = all(abs(v["mean_phase_deg"]) < 60 for v in usable_high)
+        if low_same and high_opp:
             d0 = notch["0"]["depth_db"] if notch["0"] else 0.0
             dk = notch[k]["depth_db"] if notch[k] else 0.0
+            detail = (f"the bass agrees between channels but everything above ~700 Hz is inverted "
+                      f"(phase {usable_high[0]['mean_phase_deg']:+.0f} deg, consistency {usable_high[0]['consistency']})")
             if dk >= d0 + 3:
-                tw[k] = "tweeter_reversed_relative_to_ch0 (deeper crossover notch here)"
+                tw[k] = f"HF section reversed relative to channel 0 - {detail}; deeper crossover notch on this speaker"
             elif d0 >= dk + 3:
-                tw["0"] = f"tweeter_reversed_relative_to_ch{k} (deeper crossover notch here)"
+                tw["0"] = f"HF section reversed relative to channel {k} - {detail}; deeper crossover notch on this speaker"
             else:
-                tw[k] = "tweeter_polarity_differs_from_ch0 (cannot tell which speaker; swap one jumper and re-measure)"
-                tw["0"] = tw[k].replace("ch0", f"ch{k}")
-        if p["correlation"] > 0.3 and p["correlation_mid"] > 0.3 and p["relative_sign"] != p["relative_sign_mid_800_2500"] \
-                and p["relative_sign_mid_800_2500"] == p["relative_sign_hf_3k_10k"]:
-            tw[k] = "mid+tweeter_polarity_differs_from_ch0 (bi-wire/jumper on the HF section reversed)"
+                tw[k] = (f"HF section polarity differs from channel 0 - {detail}. Which speaker is at fault needs a "
+                         "near-field check (~25 cm from the tweeter of each), or swap one and re-measure")
+                tw["0"] = tw[k].replace("channel 0", f"channel {k}")
+        elif low_same and high_same:
+            tw[k] = tw["0"] = "ok"
+        else:
+            tw[k] = tw["0"] = ("inconclusive: phase agrees in some ranges and not others; measure near-field "
+                               "(~25 cm from each driver) to settle it")
     if all(n is not None and n["depth_db"] >= 8 for n in notch.values()):
         for k in chans:
-            tw[k] += "; both channels show a crossover notch (design or both tweeters reversed)"
+            tw[k] += "; both channels show a crossover notch (may be the design, or both HF sections reversed)"
     verdict["tweeter"] = tw
     ev["algorithmic_verdict"] = verdict
     return ev
@@ -504,18 +530,26 @@ def interchannel_phase(ir_a, ir_b, sr, f_lo=100.0, f_hi=12000.0, window_s=0.006,
     if not out:
         return None
     wmax = max(r[3] for r in out)
-    pts = [[r[0], r[1], r[2], round(r[3] / wmax, 3)] for r in out]
-    # summarise: fraction of energy-weighted bands near 0 deg vs near 180 deg, per octave
+    pts = [[r[0], r[1], r[2], round(r[3] / wmax, 4)] for r in out]
+    # Summarise per range.  Weights are normalised WITHIN each range, not globally: an impulse
+    # dominated by bass would otherwise zero out every treble range and lose the very evidence a
+    # driver-section check depends on.  A range still has to carry real signal to be reported.
     summary = {}
     for lo, hi, name in ((100, 700, "100-700Hz"), (700, 2000, "700-2kHz"), (2000, 5000, "2-5kHz"), (5000, 12000, "5-12kHz")):
-        sel = [r for r in pts if lo <= r[0] < hi and r[3] > 0.05]
-        if not sel:
+        sel = [r for r in pts if lo <= r[0] < hi]
+        if len(sel) < 3 or max(r[3] for r in sel) < 1e-6:
+            continue
+        rmax = max(r[3] for r in sel)
+        sel = [r for r in sel if r[3] >= 0.02 * rmax]
+        if len(sel) < 3:
             continue
         ang = np.radians([r[1] for r in sel])
-        wts = np.array([r[3] for r in sel])
-        mean_ang = np.degrees(np.angle(np.sum(wts * np.exp(1j * ang))))
-        spread = float(np.abs(np.sum(wts * np.exp(1j * ang))) / wts.sum())   # 1 = coherent, 0 = random
+        wts = np.array([r[3] / rmax for r in sel])
+        vec = np.sum(wts * np.exp(1j * ang))
+        mean_ang = np.degrees(np.angle(vec))
+        spread = float(np.abs(vec) / wts.sum())        # 1 = coherent, 0 = random
         summary[name] = {"mean_phase_deg": round(float(mean_ang), 0), "consistency": round(spread, 2),
+                         "energy_re_peak_db": round(float(10 * np.log10(rmax + 1e-30)), 1),
                          "reads_as": ("same polarity" if abs(mean_ang) < 60 else
                                       "OPPOSITE polarity" if abs(mean_ang) > 120 else "ambiguous")}
     return {"points_f_phase_coh_weight": pts, "per_range": summary,
