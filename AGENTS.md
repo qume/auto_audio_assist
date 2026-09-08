@@ -90,6 +90,23 @@ python3 tests/gui_smoke.py    # needs a display; drives all 7 steps with simulat
 There is no audio hardware in CI. Anything touching real devices should degrade to a clear error,
 not a hang: recorders use SIGINT with timeouts, ssh uses `BatchMode=yes` and `ConnectTimeout`.
 
+## Polarity: what each method can and cannot decide
+
+- **Whole-speaker** polarity: decide from bass (`lf_sum_test`, `burst_test`, broadband
+  cross-correlation). Reliable from a listening position.
+- **Driver sections** (reversed tweeter / HF section): NOT decidable from a listening position.
+  Reflections arrive within half a cycle of the direct sound above ~1 kHz, and a per-band sign is
+  itself ambiguous by half a cycle. Proof from real data: an untouched speaker reported a flipped
+  2-5 kHz band at correlation 0.95 between two runs. Use `interchannel_phase` (a real reversal
+  holds ~180 deg across octaves; require `consistency >= 0.6` in at least two ranges) and otherwise
+  return "inconclusive" and point at the near-field check. Do not lower those gates to make a
+  synthetic test pass.
+- **Near-field** (`cli --nearfield`, `nearfield_polarity`): the answer for driver sections. Judge
+  by the sign of the FIRST excursion after onset, never the largest peak, and only read a filtered
+  view where that driver dominates (check `level_db`).
+- Filtering for polarity must be **causal** (`lowpass_causal` / `highpass_causal`). `sosfiltfilt`
+  is zero-phase and puts ringing before the impulse, making a first-excursion sign meaningless.
+
 ## Self-checks that must stay
 
 - `analysis.lf_sum_test` marks itself `invalid` above +3.5 dB. Coherent summation of two sources

@@ -75,9 +75,24 @@ at the bottom where you can ask questions in context at any time.
 | Crossover notch | Dip in each speaker's direct-sound response between 800 Hz and 8 kHz | identifies which speaker has a reversed HF section |
 | Run-to-run comparison | Which channel and which band flipped since the previous run | pins the culprit after a wiring change |
 | Sweep level check | Band levels taken straight from the recording during each sweep | independent of IR extraction; catches a muting receiver or dynamic EQ before they mislead a verdict |
+| Inter-channel phase | Phase of the cross-spectrum vs frequency, with a consistency figure | a reversed section holds ~180° across octaves, which a timing error cannot fake; reports "inconclusive" instead of guessing |
+| Near-field per driver | Sign of the first excursion with the mic ~25 cm from one driver | the room is 20 dB down, so driver polarity is unambiguous |
 
 Whole-speaker reversal flips all three bands and the sum test. A reversed tweeter/mid section
 flips only the upper bands while the bass tests stay positive.
+
+**Driver sections need a near-field measurement.** At a listening position, reflections arrive
+within half a cycle of the direct sound at treble frequencies, so per-band polarity signs there are
+not trustworthy — in real data an untouched speaker reported a flipped 2–5 kHz band at correlation
+0.95 between two runs. The tool therefore decides whole-speaker polarity from the listening
+position, but sends driver-section questions to:
+
+```bash
+python3 -m aaa.cli --nearfield 0 --label "left tweeter" --sink ... --source ...
+```
+
+one sweep on one channel with the mic ~25 cm from a single driver. Compare the `broadband` reading
+between the two speakers' tweeters, and between a speaker's tweeter and its own woofer.
 
 ![Direct sound per channel, full band / LF / HF](docs/example_ir.png)
 
